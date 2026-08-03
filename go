@@ -1,5 +1,5 @@
-# Fix sshd failing to start with error 1053 on Windows.
-# Cause is nearly always host-key file permissions, or a bad sshd_config.
+# sshd starts but times out after 30s. Find out why.
+# Prints a short report. Nothing here changes the system except a final start attempt.
 
 $ErrorActionPreference = 'Continue'
 function Say($m) { Write-Host $m }
@@ -10,57 +10,54 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     return
 }
 
-Say "`n=== sshd repair on $env:COMPUTERNAME ===`n"
+Say "`n=== sshd DIAGNOSIS on $env:COMPUTERNAME ===`n"
 
-Stop-Service sshd -Force -ErrorAction SilentlyContinue
+# --- 1. What does the service actually point at, and who runs it? ---
+Say "[1] Service registration"
+$qc = sc.exe qc sshd
+$qc | Where-Object { $_ -match 'BINARY_PATH_NAME|SERVICE_START_NAME|START_TYPE' } |
+    ForEach-Object { Say "    $($_.Trim())" }
 
-# --- 1. Host key permissions ---
-Say "[1/4] Host key permissions"
-Get-ChildItem 'C:\ProgramData\ssh\ssh_host_*_key' -ErrorAction SilentlyContinue | ForEach-Object {
-    icacls.exe $_.FullName /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
-    Say "      locked down $($_.Name)"
+# --- 2. Competing OpenSSH copies. This is the usual cause. ---
+Say "`n[2] Every sshd.exe on this machine"
+$found = @()
+foreach ($root in 'C:\Windows\System32\OpenSSH','C:\Program Files\OpenSSH',
+                  'C:\Program Files\Git\usr\bin','C:\Program Files (x86)\OpenSSH',
+                  'C:\ProgramData\chocolatey\bin') {
+    $p = Join-Path $root 'sshd.exe'
+    if (Test-Path $p) {
+        $v = (Get-Item $p).VersionInfo.ProductVersion
+        Say "    FOUND $p  (version $v)"
+        $found += $p
+    }
 }
-# The ssh directory itself must not be world-writable either.
-icacls.exe 'C:\ProgramData\ssh' /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' `
-    /grant 'Authenticated Users:(RX)' /T /C | Out-Null
+if ($found.Count -eq 0) { Say "    none in the usual places" }
+if ($found.Count -gt 1) { Say "    >>> MORE THAN ONE. This is very likely the cause. <<<" }
 
-# --- 2. Validate sshd_config ---
-Say "[2/4] Config check"
-$sshd = 'C:\Windows\System32\OpenSSH\sshd.exe'
-if (Test-Path $sshd) {
-    $t = & $sshd -t 2>&1
-    if ($t) { Say "      sshd_config complaints:"; $t | ForEach-Object { Say "        $_" } }
-    else    { Say "      config OK" }
-} else {
-    Say "      sshd.exe MISSING - the capability did not really install"
-}
+Say "`n    PATH order for ssh:"
+(Get-Command ssh.exe -All -ErrorAction SilentlyContinue) |
+    ForEach-Object { Say "      $($_.Source)" }
 
-# --- 3. Start ---
-Say "[3/4] Starting"
-sc.exe start sshd | Out-Null
-Start-Sleep -Seconds 4
-$s = (Get-Service sshd -ErrorAction SilentlyContinue).Status
-Say "      sshd is now: $s"
+# --- 3. Run sshd in the foreground and watch it fail ---
+Say "`n[3] Foreground run, 12 second window (this is the real error)"
+$exe = 'C:\Windows\System32\OpenSSH\sshd.exe'
+if (Test-Path $exe) {
+    $out = Join-Path $env:TEMP 'sshd_dbg.txt'
+    Remove-Item $out -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $exe -ArgumentList '-ddd' -NoNewWindow -PassThru `
+            -RedirectStandardError $out -RedirectStandardOutput "$out.o"
+    Start-Sleep -Seconds 12
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    foreach ($f in @($out, "$out.o")) {
+        if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
+            Get-Content $f -Tail 25 | ForEach-Object { Say "    $_" }
+        }
+    }
+} else { Say "    sshd.exe missing from System32\OpenSSH" }
 
-# --- 4. If still down, show why ---
-Say "[4/4] Result"
-if ($s -eq 'Running') {
-    $ip = (Get-NetIPAddress -AddressFamily IPv4 |
-           Where-Object { $_.IPAddress -like '192.168.*' }).IPAddress
-    Say "`n  SUCCESS. sshd is running."
-    Say "  Machine: $env:COMPUTERNAME   User: $env:USERNAME   LAN IP: $ip"
-    Say "  Tell Claude it is up. Nothing else needed from you.`n"
-} else {
-    Say "`n  STILL DOWN. Most recent sshd errors:`n"
-    Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='sshd' } `
-        -MaxEvents 5 -ErrorAction SilentlyContinue |
-        ForEach-Object { Say "  - $($_.TimeCreated.ToString('HH:mm:ss')): $($_.Message)" }
+# --- 4. Antivirus, which can silently hold the process ---
+Say "`n[4] Security products"
+Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue |
+    ForEach-Object { Say "    $($_.displayName)" }
 
-    Get-WinEvent -FilterHashtable @{ LogName='System' } -MaxEvents 200 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Message -match 'sshd|OpenSSH' } | Select-Object -First 3 |
-        ForEach-Object { Say "  - SYS $($_.TimeCreated.ToString('HH:mm:ss')): $($_.Message)" }
-
-    $log = 'C:\ProgramData\ssh\logs\sshd.log'
-    if (Test-Path $log) { Say "`n  sshd.log tail:"; Get-Content $log -Tail 15 | ForEach-Object { Say "    $_" } }
-    Say ""
-}
+Say "`n=== END. Screenshot this and send it. ===`n"
