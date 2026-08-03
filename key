@@ -1,0 +1,76 @@
+# sshd runs but rejects the key. Show why, then fix it.
+
+$ErrorActionPreference = 'Continue'
+function Say($m) { Write-Host $m }
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+      ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "`n  STOP. Not an Administrator window.`n" -ForegroundColor Red
+    return
+}
+
+$cfg = 'C:\ProgramData\ssh\sshd_config'
+$akf = 'C:\ProgramData\ssh\administrators_authorized_keys'
+$pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINp1BboF98uJXCwLOIexqspee1vWzMidWDFu8sTp6ufz pc2-to-datacenter'
+
+Say "`n=== Key auth fix on $env:COMPUTERNAME ===`n"
+
+# --- 1. Is the account actually an administrator? ---
+Say "[1] Account"
+$inAdmins = $false
+Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue | ForEach-Object {
+    Say "      admin group: $($_.Name)"
+    if ($_.Name -like "*\$env:USERNAME") { $inAdmins = $true }
+}
+Say "      $env:USERNAME is admin: $inAdmins"
+
+# --- 2. What does the current config say? ---
+Say "`n[2] Current sshd_config, relevant lines"
+if (Test-Path $cfg) {
+    Select-String -Path $cfg -Pattern '^\s*(PubkeyAuthentication|AuthorizedKeysFile|PasswordAuthentication|Match)' |
+        ForEach-Object { Say "      $($_.Line.Trim())" }
+} else { Say "      NO CONFIG FILE" }
+
+# --- 3. The key file ---
+Say "`n[3] Authorised keys file"
+if (Test-Path $akf) {
+    Say "      exists, $((Get-Item $akf).Length) bytes"
+    Get-Content $akf | ForEach-Object { Say "      > $($_.Substring(0,[Math]::Min(60,$_.Length)))..." }
+} else { Say "      MISSING" }
+
+# --- 4. Write a known-good config ---
+Say "`n[4] Writing a clean config"
+if (Test-Path $cfg) { Copy-Item $cfg "$cfg.bak-$(Get-Date -Format yyyyMMddHHmmss)" -Force }
+
+$new = @'
+# Minimal, known-good. Backup of the previous file sits alongside as .bak-<timestamp>
+PubkeyAuthentication yes
+PasswordAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp sftp-server.exe
+Match Group administrators
+       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+'@
+Set-Content -Path $cfg -Value $new -Encoding ascii
+Say "      written"
+
+# --- 5. Rewrite the key file cleanly, no BOM ---
+Say "[5] Rewriting the key file"
+[IO.File]::WriteAllText($akf, $pub + "`n", (New-Object Text.UTF8Encoding $false))
+icacls.exe $akf /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+Say "      $((Get-Item $akf).Length) bytes written"
+
+# --- 6. Restart and verify ---
+Say "`n[6] Restarting sshd"
+$sshd = 'C:\Program Files\OpenSSH\sshd.exe'
+if (Test-Path $sshd) {
+    $t = & $sshd -t 2>&1
+    if ($t) { Say "      CONFIG COMPLAINTS: $t" } else { Say "      config validates" }
+}
+Restart-Service sshd -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 4
+Say "      sshd: $((Get-Service sshd).Status)"
+
+Say "`n============================================"
+Say "  Done. Tell Claude to try connecting again."
+Say "============================================`n"
